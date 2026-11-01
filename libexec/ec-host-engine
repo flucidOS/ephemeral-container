@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# /usr/libexec/ec/ec-host-engine — Pure Podman Host Lifecycle & 1:1 Clone Orchestrator
+set -euo pipefail
+
+SESSION_NAME="ec-active-session"
+BASE_IMAGE="localhost/ec-base-clone:active"
+BUILDER_SNAP="localhost/ec-builder-snap:active"
+FINAL_IMAGE="localhost/ec-staged:latest"
+LOCK_FILE="/run/ec-session.lock"
+COMMIT_MARKER="/var/tmp/.ec-commit"
+
+SHARE_DIR="/usr/share/ephemeral-container"
+MOK_PRIV="/etc/flucid/mok/MOK.priv"
+MOK_DER="/etc/flucid/mok/MOK.der"
+
+cleanup_and_truncate() {
+    echo "[ec] Truncating ephemeral container and purging temporary Podman layers..."
+    podman umount "${SESSION_NAME}" >/dev/null 2>&1 || true
+    podman rm -f "${SESSION_NAME}" >/dev/null 2>&1 || true
+    podman rmi -f "${BASE_IMAGE}" "${BUILDER_SNAP}" >/dev/null 2>&1 || true
+    if [[ -n "${TMP_STAGE:-}" && -d "${TMP_STAGE}" ]]; then
+        rm -rf "${TMP_STAGE}"
+    fi
+    rm -f "${LOCK_FILE}" /tmp/.ec-commit-check
+    echo "[ec] Truncation complete. Zero residual container state."
+}
+
+ensure_mok_keys() {
+    if [[ ! -f "${MOK_PRIV}" || ! -f "${MOK_DER}" ]]; then
+        echo "[ec] Notice: MOK keypair not found in /etc/flucid/mok/. Generating local MOK keypair..."
+        mkdir -p /etc/flucid/mok
+        chmod 0700 /etc/flucid/mok
+        openssl req -new -x509 -newkey rsa:4096 -nodes -days 36500 \
+            -subj "/CN=FlucidOS Local Module Signing Key/" \
+            -keyout "${MOK_PRIV}" \
+            -outform DER -out "${MOK_DER}" 2>/dev/null
+        chmod 0600 "${MOK_PRIV}"
+        chmod 0644 "${MOK_DER}"
+    fi
+}
+
+resolve_local_deploy_dir() {
+    if [[ -d /ostree/deploy ]]; then
+        find /ostree/deploy -maxdepth 4 -type d -name "*.0" | head -n1
+    elif [[ -d /sysroot/ostree/deploy ]]; then
+        find /sysroot/ostree/deploy -maxdepth 4 -type d -name "*.0" | head -n1
+    else
+        echo ""
+    fi
+}
+
+cmd_open() {
+    # 1. Single-flight lock verification (with stale-lock recovery)
+    if [[ -f "${LOCK_FILE}" ]]; then
+        if podman container exists "${SESSION_NAME}" 2>/dev/null; then
+            echo "[ec] Error: An ephemeral container session is already active."
+            echo "[ec] Run 'ec exit' to seal and close it, or 'ec abort' to discard it."
+            exit 1
+        else
+            rm -f "${LOCK_FILE}"
+        fi
+    fi
+
+    touch "${LOCK_FILE}"
+    trap cleanup_and_truncate EXIT
+
+    ensure_mok_keys
+
+    # 2. Resolve 1:1 local system deployment path and Kernel ABI
+    DEPLOY_DIR="$(resolve_local_deploy_dir)"
+    if [[ -z "${DEPLOY_DIR}" || ! -d "${DEPLOY_DIR}/usr/lib/modules" ]]; then
+        echo "[ec] Error: Active OSTree deployment directory not found under /sysroot/ostree/deploy."
+        exit 1
+    fi
+
+    TARGET_COMMIT="$(basename "${DEPLOY_DIR}" | sed 's/\.0$//')"
+    KVER="$(basename "$(find "${DEPLOY_DIR}/usr/lib/modules" -mindepth 1 -maxdepth 1 -type d | head -n1)")"
+    if [[ -z "${KVER}" ]]; then
+        echo "[ec] Error: No kernel module directory found in ${DEPLOY_DIR}/usr/lib/modules."
+        exit 1
+    fi
+
+    # 3. Materialize 1:1 local system clone into Podman storage
+    echo "[ec] Materializing 1:1 local system clone (commit ${TARGET_COMMIT:0:12}, Kernel ${KVER})..."
+    tar -C "${DEPLOY_DIR}" \
+        --exclude='./proc/*' \
+        --exclude='./sys/*' \
+        --exclude='./dev/*' \
+        --exclude='./run/*' \
+        -cf - . | podman import - "${BASE_IMAGE}" >/dev/null
+
+    echo "[ec] Opening ephemeral container (Kernel ABI: ${KVER})..."
+    echo "================================================================================"
+    set +e
+    podman run --name "${SESSION_NAME}" \
+        -it \
+        --network=host \
+        --env KVER="${KVER}" \
+        --env TARGET_COMMIT="${TARGET_COMMIT:0:12}" \
+        --env EC_COMMIT_MARKER="${COMMIT_MARKER}" \
+        "${BASE_IMAGE}" \
+        /bin/bash --rcfile "${SHARE_DIR}/ec-profile.sh" -i
+    set -e
+    echo "================================================================================"
+
+    # 4. Verify whether user ran 'ec exit' (commit) or exited without committing
+    rm -f /tmp/.ec-commit-check
+    if ! podman cp "${SESSION_NAME}:${COMMIT_MARKER}" /tmp/.ec-commit-check >/dev/null 2>&1; then
+        echo "[ec] Session closed without 'ec exit'. Discarding all changes..."
+        exit 0
+    fi
+    rm -f /tmp/.ec-commit-check
+
+    # 5. Snapshot Stage 1 & execute Stage 2 (MOK sign + single depmod + clean copy)
+    echo "[ec] Committing Stage 1 snapshot for finalization..."
+    podman commit -q "${SESSION_NAME}" "${BUILDER_SNAP}" >/dev/null
+
+    echo "[ec] Running fail-closed finalizer (MOK signing + unified depmod pass)..."
+    podman build \
+        --no-cache \
+        --layers=false \
+        --build-arg BASE_CLONE="${BASE_IMAGE}" \
+        --build-arg BUILDER_SNAP="${BUILDER_SNAP}" \
+        --build-arg KVER="${KVER}" \
+        --secret id=mok_key,src="${MOK_PRIV}" \
+        --secret id=mok_der,src="${MOK_DER}" \
+        -t "${FINAL_IMAGE}" \
+        -f "${SHARE_DIR}/Containerfile.seal" \
+        "${SHARE_DIR}"
+
+    # 6. Stage sealed image into bootc
+    echo "[ec] Staging sealed deployment via bootc..."
+    bootc switch --transport containers-storage "${FINAL_IMAGE}"
+    echo "[ec] Success! New deployment staged. Reboot to activate changes."
+}
+
+case "${1:-}" in
+    open)
+        cmd_open
+        ;;
+    force-exit)
+        if podman container exists "${SESSION_NAME}" 2>/dev/null; then
+            echo "[ec] Signaling active session to commit and exit..."
+            podman exec "${SESSION_NAME}" touch "${COMMIT_MARKER}" 2>/dev/null || true
+            podman stop -t 2 "${SESSION_NAME}" >/dev/null 2>&1 || true
+        else
+            echo "[ec] No active ephemeral container session found."
+            exit 1
+        fi
+        ;;
+    force-abort)
+        if podman container exists "${SESSION_NAME}" 2>/dev/null; then
+            echo "[ec] Signaling active session to abort and truncate..."
+            podman exec "${SESSION_NAME}" rm -f "${COMMIT_MARKER}" 2>/dev/null || true
+            podman stop -t 2 "${SESSION_NAME}" >/dev/null 2>&1 || true
+        else
+            echo "[ec] No active ephemeral container session found."
+            exit 1
+        fi
+        ;;
+    status)
+        if podman container exists "${SESSION_NAME}" 2>/dev/null; then
+            echo "[ec] Active session running:"
+            podman ps --filter "name=^${SESSION_NAME}$"
+        else
+            echo "[ec] No active ephemeral container session."
+        fi
+        ;;
+    *)
+        echo "Internal error: unknown action '${1:-}'"
+        exit 1
+        ;;
+esac

@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# /usr/libexec/ec/ec-container-finalize — In-Container MOK Signer & Unified depmod
+set -euo pipefail
+
+KVER="${1:?Error: Kernel version (KVER) argument is required}"
+MOK_PRIV="/run/secrets/mok.priv"
+MOK_DER="/run/secrets/mok.der"
+SIGN_FILE="/usr/lib/modules/${KVER}/build/scripts/sign-file"
+
+echo "[ec-finalize] Verifying MOK secret mounts..."
+if [[ ! -f "${MOK_PRIV}" || ! -f "${MOK_DER}" ]]; then
+    echo "[ec-finalize] FATAL: MOK secret keys not mounted at /run/secrets/."
+    exit 1
+fi
+
+# Ensure mandatory target directories exist so Stage 2 COPY never fails
+mkdir -p "/usr/lib/modules/${KVER}/extra" \
+         "/usr/lib/modprobe.d" \
+         "/usr/local/bin" \
+         "/usr/local/sbin" \
+         "/usr/local/lib"
+
+# 1. Sign all out-of-tree .ko modules installed under /usr/lib/modules/${KVER}/extra
+shopt -s nullglob globstar
+ko_files=("/usr/lib/modules/${KVER}/extra"/**/*.ko "/usr/lib/modules/${KVER}/updates"/**/*.ko)
+
+if [[ ${#ko_files[@]} -gt 0 ]]; then
+    if [[ ! -x "${SIGN_FILE}" ]]; then
+        echo "[ec-finalize] FATAL: Kernel sign-file utility missing at ${SIGN_FILE}."
+        exit 1
+    fi
+
+    for ko in "${ko_files[@]}"; do
+        echo "[ec-finalize] Signing module: $(basename "${ko}")..."
+        "${SIGN_FILE}" sha256 "${MOK_PRIV}" "${MOK_DER}" "${ko}"
+    done
+else
+    echo "[ec-finalize] No out-of-tree .ko modules found in extra/ or updates/; skipping MOK signing."
+fi
+
+# 2. Single unified depmod pass across in-tree + newly installed modules
+echo "[ec-finalize] Running single unified depmod -a pass for kernel ${KVER}..."
+depmod -a "${KVER}"
+
+# 3. Verify modules.dep integrity
+if [[ ! -s "/usr/lib/modules/${KVER}/modules.dep" ]]; then
+    echo "[ec-finalize] FATAL: modules.dep is missing or empty after depmod pass!"
+    exit 1
+fi
+
+echo "[ec-finalize] Finalization complete."

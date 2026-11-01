@@ -1,0 +1,26 @@
+# ==============================================================================
+# FlucidOS Ephemeral Container — Stage 2 Clean Artifact Sealer (Pure Podman)
+# ==============================================================================
+ARG BASE_CLONE
+ARG BUILDER_SNAP
+ARG KVER
+
+# ------------------------------------------------------------------------------
+# STAGE 1: Finalize User Snapshot (MOK Signing + Single Unified depmod Pass)
+# ------------------------------------------------------------------------------
+FROM ${BUILDER_SNAP} AS finalize
+ARG KVER
+
+RUN --mount=type=secret,id=mok_key,target=/run/secrets/mok.priv,required=true \
+    --mount=type=secret,id=mok_der,target=/run/secrets/mok.der,required=true \
+    /usr/libexec/ec/ec-container-finalize "${KVER}"
+
+# ------------------------------------------------------------------------------
+# STAGE 2: Clean 1:1 System Clone (Extracts only clean system artifacts)
+# ------------------------------------------------------------------------------
+FROM ${BASE_CLONE} AS final
+ARG KVER
+
+COPY --from=finalize "/usr/lib/modules/${KVER}" "/usr/lib/modules/${KVER}"
+COPY --from=finalize /usr/lib/modprobe.d/ /usr/lib/modprobe.d/
+COPY --from=finalize /usr/local/ /usr/local/

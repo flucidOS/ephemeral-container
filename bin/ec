@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# /usr/bin/ec — Ephemeral Container (ec) CLI for FlucidOS
+set -euo pipefail
+
+CMD="${1:-help}"
+COMMIT_MARKER="/var/tmp/.ec-commit"
+
+# ==============================================================================
+# CONTEXT A: Running INSIDE the Ephemeral Container (1:1 System Clone)
+# ==============================================================================
+if [[ -f "/run/.ec-session" ]]; then
+    case "${CMD}" in
+        exit)
+            echo "[ec] Marking session for sealing, MOK signing, and unified depmod..."
+            touch "${COMMIT_MARKER}"
+            kill -TERM "${PPID}" 2>/dev/null || exit 0
+            exit 0
+            ;;
+        abort)
+            echo "[ec] Aborting session. All changes will be discarded and truncated..."
+            rm -f "${COMMIT_MARKER}"
+            kill -TERM "${PPID}" 2>/dev/null || exit 0
+            exit 0
+            ;;
+        open)
+            echo "[ec] Error: You are already inside an active ephemeral container session."
+            exit 1
+            ;;
+        status)
+            echo "[ec] Active inside 1:1 clone (Kernel ABI: ${KVER:-unknown})"
+            exit 0
+            ;;
+        *)
+            echo "FlucidOS Ephemeral Container (In-Session)"
+            echo "Usage:"
+            echo "  ec exit    - Seal manual installations, run depmod, and truncate container"
+            echo "  ec abort   - Discard all changes and truncate container immediately"
+            echo "  ec status  - Show current container session info"
+            exit 1
+            ;;
+    esac
+fi
+
+# ==============================================================================
+# CONTEXT B: Running ON THE HOST
+# ==============================================================================
+case "${CMD}" in
+    open)
+        if [[ "${EUID}" -ne 0 ]]; then
+            exec sudo /usr/libexec/ec/ec-host-engine open
+        else
+            exec /usr/libexec/ec/ec-host-engine open
+        fi
+        ;;
+    exit)
+        if [[ "${EUID}" -ne 0 ]]; then
+            exec sudo /usr/libexec/ec/ec-host-engine force-exit
+        else
+            exec /usr/libexec/ec/ec-host-engine force-exit
+        fi
+        ;;
+    abort)
+        if [[ "${EUID}" -ne 0 ]]; then
+            exec sudo /usr/libexec/ec/ec-host-engine force-abort
+        else
+            exec /usr/libexec/ec/ec-host-engine force-abort
+        fi
+        ;;
+    status)
+        if [[ "${EUID}" -ne 0 ]]; then
+            exec sudo /usr/libexec/ec/ec-host-engine status
+        else
+            exec /usr/libexec/ec/ec-host-engine status
+        fi
+        ;;
+    *)
+        echo "FlucidOS Ephemeral Container (ec)"
+        echo "Usage: ec <command>"
+        echo ""
+        echo "Commands:"
+        echo "  ec open    - Clone 1:1 local system space and open interactive shell"
+        echo "  ec exit    - Seal and truncate an open ephemeral container session"
+        echo "  ec abort   - Discard and truncate an open ephemeral container session"
+        echo "  ec status  - Check if an ephemeral container is currently active"
+        exit 1
+        ;;
+esac
